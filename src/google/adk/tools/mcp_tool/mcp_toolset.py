@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from typing import Callable
 from typing import Dict
 from typing import List
@@ -96,6 +97,8 @@ class McpToolset(BaseToolset):
       header_provider: Optional[
           Callable[[ReadonlyContext], Dict[str, str]]
       ] = None,
+      cache: bool = False,
+      cache_ttl_seconds: Optional[int] = None,
   ):
     """Initializes the McpToolset.
 
@@ -121,6 +124,10 @@ class McpToolset(BaseToolset):
         tools.
       header_provider: A callable that takes a ReadonlyContext and returns a
         dictionary of headers to be used for the MCP session.
+      cache: If True, the toolset will cache the response from the
+        first `list_tools` call and reuse it for subsequent calls.
+      cache_ttl_seconds: If set, the in-memory cache will expire
+        after this many seconds.
     """
     super().__init__(tool_filter=tool_filter, tool_name_prefix=tool_name_prefix)
 
@@ -139,6 +146,10 @@ class McpToolset(BaseToolset):
     self._auth_scheme = auth_scheme
     self._auth_credential = auth_credential
     self._require_confirmation = require_confirmation
+    self._cache = cache
+    self._cache_ttl_seconds = cache_ttl_seconds
+    self._cached_tool_response: Optional[ListToolsResult] = None
+    self._cache_creation_time: Optional[float] = None
 
   @retry_on_errors
   async def get_tools(
@@ -154,41 +165,62 @@ class McpToolset(BaseToolset):
     Returns:
         List[BaseTool]: A list of tools available under the specified context.
     """
-    headers = (
-        self._header_provider(readonly_context)
-        if self._header_provider and readonly_context
-        else None
-    )
-    # Get session from session manager
-    session = await self._mcp_session_manager.create_session(headers=headers)
+    tools_response: Optional[ListToolsResult] = None
 
-    # Fetch available tools from the MCP server
-    timeout_in_seconds = (
-        self._connection_params.timeout
-        if hasattr(self._connection_params, "timeout")
-        else None
-    )
-    try:
-      tools_response: ListToolsResult = await asyncio.wait_for(
-          session.list_tools(), timeout=timeout_in_seconds
+    # Check for a valid cache
+    is_cache_valid = False
+    if self._cache and self._cached_tool_response:
+      is_cache_valid = True
+      if self._cache_ttl_seconds is not None:
+        if self._cache_creation_time is None:
+          is_cache_valid = False  # Should not happen
+        else:
+          elapsed = time.monotonic() - self._cache_creation_time
+          if elapsed > self._cache_ttl_seconds:
+            is_cache_valid = False
+
+    if is_cache_valid:
+      tools_response = self._cached_tool_response
+    else:
+      headers = (
+          self._header_provider(readonly_context)
+          if self._header_provider and readonly_context
+          else None
       )
-    except Exception as e:
-      raise ConnectionError("Failed to get tools from MCP server.") from e
+      # Get session from session manager
+      session = await self._mcp_session_manager.create_session(headers=headers)
+
+      # Fetch available tools from the MCP server
+      timeout_in_seconds = (
+          self._connection_params.timeout
+          if hasattr(self._connection_params, "timeout")
+          else None
+      )
+      try:
+        tools_response = await asyncio.wait_for(
+            session.list_tools(), timeout=timeout_in_seconds
+        )
+        if self._cache:
+          self._cached_tool_response = tools_response
+          self._cache_creation_time = time.monotonic()
+      except Exception as e:
+        raise ConnectionError("Failed to get tools from MCP server.") from e
 
     # Apply filtering based on context and tool_filter
     tools = []
-    for tool in tools_response.tools:
-      mcp_tool = MCPTool(
-          mcp_tool=tool,
-          mcp_session_manager=self._mcp_session_manager,
-          auth_scheme=self._auth_scheme,
-          auth_credential=self._auth_credential,
-          require_confirmation=self._require_confirmation,
-          header_provider=self._header_provider,
-      )
+    if tools_response:
+      for tool in tools_response.tools:
+        mcp_tool = MCPTool(
+            mcp_tool=tool,
+            mcp_session_manager=self._mcp_session_manager,
+            auth_scheme=self._auth_scheme,
+            auth_credential=self._auth_credential,
+            require_confirmation=self._require_confirmation,
+            header_provider=self._header_provider,
+        )
 
-      if self._is_tool_selected(mcp_tool, readonly_context):
-        tools.append(mcp_tool)
+        if self._is_tool_selected(mcp_tool, readonly_context):
+          tools.append(mcp_tool)
     return tools
 
   async def close(self) -> None:
