@@ -150,6 +150,7 @@ class McpToolset(BaseToolset):
     self._cache_ttl_seconds = cache_ttl_seconds
     self._cached_tool_response: Optional[ListToolsResult] = None
     self._cache_creation_time: Optional[float] = None
+    self._cache_lock = asyncio.Lock()
 
   @retry_on_errors
   async def get_tools(
@@ -165,50 +166,58 @@ class McpToolset(BaseToolset):
     Returns:
         List[BaseTool]: A list of tools available under the specified context.
     """
-    tools_response: Optional[ListToolsResult] = None
 
-    # Check for a valid cache
-    def _is_cache_valid():
-        if not self._cache or not self._cached_tool_response:
-            return False
+    def _is_cache_valid() -> bool:
+      if not self._cache or not self._cached_tool_response:
+        return False
 
-        if self._cache_ttl_seconds is None:
-            return True  # No TTL set, consider cache always valid
+      if self._cache_ttl_seconds is None:
+        return True  # No TTL set, consider cache always valid
 
-        if self._cache_creation_time is None:
-            return False  # This should not happen in a well-initialized system
+      if self._cache_creation_time is None:
+        # This should not happen in a well-initialized system
+        return False
 
-        elapsed = time.monotonic() - self._cache_creation_time
-        return elapsed <= self._cache_ttl_seconds
-    
-    is_cache_valid = _is_cache_valid()
-            
-    if is_cache_valid:
+      elapsed = time.monotonic() - self._cache_creation_time
+      return elapsed <= self._cache_ttl_seconds
+
+    # First check without a lock for performance.
+    if _is_cache_valid():
       tools_response = self._cached_tool_response
     else:
-      headers = (
-          self._header_provider(readonly_context)
-          if self._header_provider and readonly_context
-          else None
-      )
-      # Get session from session manager
-      session = await self._mcp_session_manager.create_session(headers=headers)
+      # If cache is invalid, acquire lock to prevent stampede.
+      async with self._cache_lock:
+        # Double-check if cache was populated while waiting for the lock.
+        if _is_cache_valid():
+          tools_response = self._cached_tool_response
+        else:
+          # Cache is still invalid, so we are the one to fetch it.
+          headers = (
+              self._header_provider(readonly_context)
+              if self._header_provider and readonly_context
+              else None
+          )
+          session = await self._mcp_session_manager.create_session(
+              headers=headers
+          )
 
-      # Fetch available tools from the MCP server
-      timeout_in_seconds = (
-          self._connection_params.timeout
-          if hasattr(self._connection_params, "timeout")
-          else None
-      )
-      try:
-        tools_response = await asyncio.wait_for(
-            session.list_tools(), timeout=timeout_in_seconds
-        )
-        if self._cache:
-          self._cached_tool_response = tools_response
-          self._cache_creation_time = time.monotonic()
-      except Exception as e:
-        raise ConnectionError("Failed to get tools from MCP server.") from e
+          timeout_in_seconds = (
+              self._connection_params.timeout
+              if hasattr(self._connection_params, "timeout")
+              else None
+          )
+          try:
+            fetched_tools = await asyncio.wait_for(
+                session.list_tools(), timeout=timeout_in_seconds
+            )
+            if self._cache:
+              self._cached_tool_response = fetched_tools
+              self._cache_creation_time = time.monotonic()
+            tools_response = fetched_tools
+          except Exception as e:
+            raise ConnectionError(
+                "Failed to get tools from MCP server."
+            ) from e
 
     # Apply filtering based on context and tool_filter
     tools = []

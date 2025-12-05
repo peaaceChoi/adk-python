@@ -163,3 +163,50 @@ async def test_mcp_toolset_cache_with_ttl_expired():
 
   await toolset.get_tools()
   assert mock_session.list_tools.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_cache_concurrency():
+  """Test that list_tools is called only once during concurrent requests."""
+  mock_connection_params = MagicMock()
+  mock_connection_params.timeout = None
+
+  # Create a mock session manager. Add a small delay to the mock call
+  # to simulate network latency and increase the chance of a race condition.
+  mock_session_manager = MagicMock()
+  mock_session = MagicMock()
+
+  mock_tool1 = MagicMock()
+  mock_tool1.name = "tool1"
+  mock_tool1.description = "tool 1 desc"
+  list_tools_result = MagicMock()
+  list_tools_result.tools = [mock_tool1]
+
+  async def delayed_list_tools():
+    await asyncio.sleep(0.1)
+    return list_tools_result
+
+  mock_session.list_tools = AsyncMock(side_effect=delayed_list_tools)
+  mock_session_manager.create_session = AsyncMock(return_value=mock_session)
+
+  # Initialize the toolset with caching enabled
+  toolset = McpToolset(connection_params=mock_connection_params, cache=True)
+  toolset._mcp_session_manager = mock_session_manager
+
+  # Create multiple concurrent tasks to call get_tools
+  tasks = [asyncio.create_task(toolset.get_tools()) for _ in range(5)]
+
+  # Run all tasks concurrently
+  results = await asyncio.gather(*tasks)
+
+  # Assert that list_tools was only called once, thanks to the lock
+  mock_session.list_tools.assert_called_once()
+
+  # Assert that all results are the same and correct
+  assert len(results) == 5
+  for result in results:
+    assert len(result) == 1
+    assert result[0].name == "tool1"
+
+  # Check that the first result is the same as the others
+  assert all(results[0][0].name == r[0].name for r in results[1:])
