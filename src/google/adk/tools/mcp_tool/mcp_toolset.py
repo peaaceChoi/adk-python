@@ -168,17 +168,21 @@ class McpToolset(BaseToolset):
     tools_response: Optional[ListToolsResult] = None
 
     # Check for a valid cache
-    is_cache_valid = False
-    if self._cache and self._cached_tool_response:
-      is_cache_valid = True
-      if self._cache_ttl_seconds is not None:
-        if self._cache_creation_time is None:
-          is_cache_valid = False  # Should not happen
-        else:
-          elapsed = time.monotonic() - self._cache_creation_time
-          if elapsed > self._cache_ttl_seconds:
-            is_cache_valid = False
+    def _is_cache_valid():
+        if not self._cache or not self._cached_tool_response:
+            return False
 
+        if self._cache_ttl_seconds is None:
+            return True  # No TTL set, consider cache always valid
+
+        if self._cache_creation_time is None:
+            return False  # This should not happen in a well-initialized system
+
+        elapsed = time.monotonic() - self._cache_creation_time
+        return elapsed <= self._cache_ttl_seconds
+    
+    is_cache_valid = _is_cache_valid()
+            
     if is_cache_valid:
       tools_response = self._cached_tool_response
     else:
@@ -262,6 +266,7 @@ class McpToolset(BaseToolset):
         auth_scheme=mcp_toolset_config.auth_scheme,
         auth_credential=mcp_toolset_config.auth_credential,
     )
+    
 
 
 class MCPToolset(McpToolset):

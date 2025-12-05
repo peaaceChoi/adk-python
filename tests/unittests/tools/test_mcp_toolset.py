@@ -14,6 +14,7 @@
 
 """Unit tests for McpToolset."""
 
+import asyncio
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
@@ -69,3 +70,96 @@ async def test_mcp_toolset_with_prefix():
   # Assert that the original tools are not modified
   assert tools[0].name == "tool1"
   assert tools[1].name == "tool2"
+
+
+def _create_mock_session_manager():
+  """Helper to create a mock MCPSessionManager."""
+  mock_session_manager = MagicMock()
+  mock_session = MagicMock()
+
+  mock_tool1 = MagicMock()
+  mock_tool1.name = "tool1"
+  mock_tool1.description = "tool 1 desc"
+  mock_tool2 = MagicMock()
+  mock_tool2.name = "tool2"
+  mock_tool2.description = "tool 2 desc"
+  list_tools_result = MagicMock()
+  list_tools_result.tools = [mock_tool1, mock_tool2]
+
+  mock_session.list_tools = AsyncMock(return_value=list_tools_result)
+  mock_session_manager.create_session = AsyncMock(return_value=mock_session)
+  return mock_session_manager, mock_session
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_cache_disabled():
+  """Test that list_tools is called every time when cache is disabled."""
+  mock_connection_params = MagicMock()
+  mock_connection_params.timeout = None
+  mock_session_manager, mock_session = _create_mock_session_manager()
+
+  toolset = McpToolset(connection_params=mock_connection_params, cache=False)
+  toolset._mcp_session_manager = mock_session_manager
+
+  await toolset.get_tools()
+  await toolset.get_tools()
+
+  assert mock_session.list_tools.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_cache_enabled():
+  """Test that list_tools is called only once when cache is enabled."""
+  mock_connection_params = MagicMock()
+  mock_connection_params.timeout = None
+  mock_session_manager, mock_session = _create_mock_session_manager()
+
+  toolset = McpToolset(connection_params=mock_connection_params, cache=True)
+  toolset._mcp_session_manager = mock_session_manager
+
+  tools1 = await toolset.get_tools()
+  tools2 = await toolset.get_tools()
+
+  mock_session.list_tools.assert_called_once()
+  assert len(tools1) == 2
+  assert len(tools2) == 2
+  assert tools1[0].name == tools2[0].name
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_cache_with_ttl_not_expired():
+  """Test that cache is used when TTL has not expired."""
+  mock_connection_params = MagicMock()
+  mock_connection_params.timeout = None
+  mock_session_manager, mock_session = _create_mock_session_manager()
+
+  toolset = McpToolset(
+      connection_params=mock_connection_params, cache=True, cache_ttl_seconds=10
+  )
+  toolset._mcp_session_manager = mock_session_manager
+
+  await toolset.get_tools()
+  await toolset.get_tools()
+
+  mock_session.list_tools.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_cache_with_ttl_expired():
+  """Test that list_tools is called again after TTL expires."""
+  mock_connection_params = MagicMock()
+  mock_connection_params.timeout = None
+  mock_session_manager, mock_session = _create_mock_session_manager()
+
+  toolset = McpToolset(
+      connection_params=mock_connection_params, cache=True, cache_ttl_seconds=1
+  )
+  toolset._mcp_session_manager = mock_session_manager
+
+  await toolset.get_tools()
+  mock_session.list_tools.assert_called_once()
+
+  await asyncio.sleep(1.1)
+
+  await toolset.get_tools()
+  assert mock_session.list_tools.call_count == 2
